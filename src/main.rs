@@ -51,10 +51,10 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        // 예: GET /e/123456789012345678.webp  또는 /e/1234.gif
+        // 예: GET /e/123456789012345678.webp
         .route("/e/:name", get(resize_handler))
         .with_state(state)
-        .into_make_service_with_connect_info::<SocketAddr>();
+        .into_make_service_with_connect_info::<SocketAddr>(); 
 
     let addr: SocketAddr = "0.0.0.0:53292".parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -104,28 +104,37 @@ async fn resize_handler(
 ) -> impl IntoResponse {
     info!("Request received - Emoji ID: {}", name);
 
-    // 캐시 키: 원본 파일명(확장자 포함) 고정 리사이즈(160x160)
-    let key = format!("{}:160x160:webp", name);
+    // 확장자 제거 (.webp, .gif, .png 등)
+    let emoji_id = name
+        .split('.')
+        .next()
+        .unwrap_or(&name)
+        .to_string();
+    
+    info!("Processed Emoji ID: {}", emoji_id);
+
+    // 캐시 키: 이모지 ID만 사용 (고정 크기 160x160, WebP 포맷)
+    let key = emoji_id.clone();
 
     if let Some(bytes) = state.cache.get(&key).await {
-        info!("Cache hit for emoji: {}", name);
+        info!("Cache hit for emoji: {}", emoji_id);
         let etag = make_etag(&bytes);
         if header_matches(&headers, header::IF_NONE_MATCH, &etag) {
             return (StatusCode::NOT_MODIFIED, with_common_headers(etag, None)).into_response();
         }
         return (
-            with_common_headers(etag, Some(&format_src(&name))),
+            with_common_headers(etag, Some(&format_src(&emoji_id))),
             bytes.as_ref().clone(),
         )
             .into_response();
     }
 
-    info!("Cache miss - fetching emoji: {}", name);
+    info!("Cache miss - fetching emoji: {}", emoji_id);
 
     // 원본 URL 구성: Discord CDN (애니메이션 WebP 지원)
     let src = format!(
-        "https://cdn.discordapp.com/emojis/{}?size=160?size=160&animated=true",
-        name
+        "https://cdn.discordapp.com/emojis/{}?size=160&animated=true",
+        emoji_id
     );
 
     // 원본 fetch
@@ -138,24 +147,24 @@ async fn resize_handler(
     {
         Ok(r) => r,
         Err(e) => {
-            error!("Fetch error for emoji {}: {}", name, e);
+            error!("Fetch error for emoji {}: {}", emoji_id, e);
             return (StatusCode::BAD_GATEWAY, "upstream fetch failed").into_response();
         }
     };
 
     if resp.status() == StatusCode::NOT_FOUND {
-        warn!("Emoji not found: {}", name);
+        warn!("Emoji not found: {}", emoji_id);
         return (StatusCode::NOT_FOUND, "emoji not found").into_response();
     }
     if !resp.status().is_success() {
-        error!("Upstream error for emoji {}: status {}", name, resp.status());
+        error!("Upstream error for emoji {}: status {}", emoji_id, resp.status());
         return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
     }
 
     let body = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            error!("Read body error for emoji {}: {}", name, e);
+            error!("Read body error for emoji {}: {}", emoji_id, e);
             return (StatusCode::BAD_GATEWAY, "upstream read failed").into_response();
         }
     };
@@ -164,17 +173,17 @@ async fn resize_handler(
     let is_animated = is_animated_webp(&body);
     
     if is_animated {
-        info!("Processing animated WebP emoji: {}", name);
+        info!("Processing animated WebP emoji: {}", emoji_id);
         // 애니메이션 WebP는 그대로 반환 (현재 image crate는 애니메이션 WebP 리사이징 미지원)
         let bytes = Arc::new(body.to_vec());
         state.cache.insert(key, bytes.clone()).await;
         
         let etag = make_etag(&bytes);
         info!("Animated WebP processed - emoji: {}, size: {} bytes", 
-              name, bytes.len());
+              emoji_id, bytes.len());
         
         return (
-            with_common_headers(etag, Some(&format_src(&name))),
+            with_common_headers(etag, Some(&format_src(&emoji_id))),
             bytes.as_ref().clone(),
         )
             .into_response();
@@ -184,14 +193,14 @@ async fn resize_handler(
     let img: DynamicImage = match image::load_from_memory(&body) {
         Ok(i) => i,
         Err(e) => {
-            error!("Decode error for emoji {}: {}", name, e);
+            error!("Decode error for emoji {}: {}", emoji_id, e);
             return (StatusCode::UNSUPPORTED_MEDIA_TYPE, "decode failed").into_response();
         }
     };
 
     let original_dimensions = img.dimensions();
     info!("Static WebP processing - emoji: {}, original: {}x{}", 
-          name, original_dimensions.0, original_dimensions.1);
+          emoji_id, original_dimensions.0, original_dimensions.1);
 
     // 종횡비를 유지하면서 160x160 박스 안에 맞는 최대 크기로 리사이즈
     let resized = img.resize(160, 160, FilterType::Lanczos3);
@@ -199,7 +208,7 @@ async fn resize_handler(
     
     let mut out = Vec::new();
     if let Err(e) = resized.write_to(&mut Cursor::new(&mut out), ImageFormat::WebP) {
-        error!("Encode error for emoji {}: {}", name, e);
+        error!("Encode error for emoji {}: {}", emoji_id, e);
         return (StatusCode::INTERNAL_SERVER_ERROR, "encode failed").into_response();
     }
     let bytes = Arc::new(out);
@@ -208,12 +217,12 @@ async fn resize_handler(
     state.cache.insert(key, bytes.clone()).await;
 
     info!("Static WebP processed - emoji: {}, {}x{} → {}x{}, size: {} bytes", 
-          name, original_dimensions.0, original_dimensions.1, 
+          emoji_id, original_dimensions.0, original_dimensions.1, 
           final_dimensions.0, final_dimensions.1, bytes.len());
 
     let etag = make_etag(&bytes);
     (
-        with_common_headers(etag, Some(&format_src(&name))),
+        with_common_headers(etag, Some(&format_src(&emoji_id))),
         bytes.as_ref().clone(),
     )
         .into_response()
