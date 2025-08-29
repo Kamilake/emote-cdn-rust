@@ -1,0 +1,16 @@
+# cd /home/kamilake/docker/emote-cdn-rust && docker run --rm -p 53292:53292 emoji-resizer
+
+services:
+  emoji-resizer:
+    build: .
+    ports:
+      - "53292:53292"
+    environment:
+      - RUST_LOG=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:53292/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
